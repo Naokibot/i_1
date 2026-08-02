@@ -124,4 +124,12 @@ jobs:
           gradle-version: '8.14.3'
       - name: Run provider tests
         working-directory: java/migration-provider
-        run: gradle test --no-daemon
+        shell: bash
+        run: |
+          set +e
+          gradle test --no-daemon --stacktrace
+          status=$?
+          if test "$status" -ne 0; then
+            find build/test-results/test -maxdepth 1 -type f -name '*.xml' -print -exec cat {} \; || true
+          fi
+          exit "$status"
