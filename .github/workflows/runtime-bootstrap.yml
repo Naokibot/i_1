@@ -27,7 +27,7 @@ jobs:
             cat .bootstrap/chunk-* | base64 -d > /tmp/runtime.tar.gz
             printf '%s  %s\n' 'a0df6eb55409bea909e75e6d3bdd58517df5dab6a8c8ed28fae33cce9216034b' '/tmp/runtime.tar.gz' | sha256sum -c -
             tar -xzf /tmp/runtime.tar.gz -C .
-            rm -rf .bootstrap .github/workflows/materialize-runtime.yml
+            rm -rf .bootstrap .github/workflows/materialize-runtime.yml .github/workflows/runtime.yml
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add -A
@@ -81,7 +81,6 @@ jobs:
           cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
           cmake --build build/pkcs11 --parallel 2
           GATEWAY=./build/tls/pqm-tls-gateway ./runtime-tests/tls_gateway_smoke.sh
-          RECRYPT='./cmd/recrypt-worker/recrypt-worker' true
           ./runtime-tests/recrypt_smoke.sh
       - name: Verify Java migration provider
         working-directory: java/migration-provider
