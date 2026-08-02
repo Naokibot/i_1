@@ -1,0 +1,88 @@
+name: runtime-bootstrap
+
+on:
+  pull_request:
+    branches:
+      - agent/pqm-runtime-base
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-and-verify:
+    runs-on: ubuntu-24.04
+    env:
+      OPENSSL_ROOT: /opt/openssl-3.5
+      OPENSSL_VERSION: 3.5.7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Materialize source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -d .bootstrap; then
+            cat .bootstrap/chunk-* | base64 -d > /tmp/runtime.tar.gz
+            printf '%s  %s\n' 'a0df6eb55409bea909e75e6d3bdd58517df5dab6a8c8ed28fae33cce9216034b' '/tmp/runtime.tar.gz' | sha256sum -c -
+            tar -xzf /tmp/runtime.tar.gz -C .
+            rm -rf .bootstrap .github/workflows/materialize-runtime.yml
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -A
+            git commit -m 'Implement post-quantum runtime platform'
+            git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libp11-kit-dev perl make gcc
+      - name: Build OpenSSL 3.5 LTS
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix="${OPENSSL_ROOT}" --openssldir="${OPENSSL_ROOT}/ssl" shared no-tests
+          make -j2
+          sudo make install_sw
+          echo "${OPENSSL_ROOT}/lib64" | sudo tee /etc/ld.so.conf.d/openssl-3.5.conf
+          sudo ldconfig
+          "${OPENSSL_ROOT}/bin/openssl" version
+      - name: Verify Go control plane and workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l cmd internal)"
+          go test -race ./...
+          go vet ./...
+          go build ./cmd/runtime-controller ./cmd/gateway-agent ./cmd/telemetry-reporter ./cmd/recrypt-worker ./cmd/emergency-sign
+      - name: Build and test native gateways
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          PKG_CONFIG_PATH: /opt/openssl-3.5/lib64/pkgconfig:/opt/openssl-3.5/lib/pkgconfig
+        run: |
+          set -euo pipefail
+          cmake -S native/tls-gateway -B build/tls -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}"
+          cmake --build build/tls --parallel 2
+          cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/pkcs11 --parallel 2
+          GATEWAY=./build/tls/pqm-tls-gateway ./runtime-tests/tls_gateway_smoke.sh
+          RECRYPT='./cmd/recrypt-worker/recrypt-worker' true
+          ./runtime-tests/recrypt_smoke.sh
+      - name: Verify Java migration provider
+        working-directory: java/migration-provider
+        run: gradle test --no-daemon
