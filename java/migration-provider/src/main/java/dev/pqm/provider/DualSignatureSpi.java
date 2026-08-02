@@ -83,7 +83,15 @@ public final class DualSignatureSpi extends SignatureSpi {
         }
         byte[] payload = message.toByteArray();
         try {
-            ParallelSignatureEnvelope envelope = ParallelSignatureEnvelope.decode(signatureBytes);
+            if (signatureBytes == null) {
+                return false;
+            }
+            ParallelSignatureEnvelope envelope;
+            try {
+                envelope = ParallelSignatureEnvelope.decode(signatureBytes);
+            } catch (IOException malformedEnvelope) {
+                return false;
+            }
             if (!envelope.classicalAlgorithm().equals(verificationKey.classicalSignatureAlgorithm())
                     || !envelope.postQuantumAlgorithm().equals(verificationKey.postQuantumSignatureAlgorithm())) {
                 return false;
@@ -91,15 +99,17 @@ public final class DualSignatureSpi extends SignatureSpi {
             Signature classical = AlgorithmResolver.signature(envelope.classicalAlgorithm());
             classical.initVerify(verificationKey.classicalKey());
             classical.update(payload);
+            if (!verifyCandidate(classical, envelope.classicalSignature())) {
+                return false;
+            }
             Signature postQuantum = AlgorithmResolver.signature(envelope.postQuantumAlgorithm());
             postQuantum.initVerify(verificationKey.postQuantumKey());
             postQuantum.update(payload);
-            return classical.verify(envelope.classicalSignature())
-                    && postQuantum.verify(envelope.postQuantumSignature());
-        } catch (IOException exception) {
-            throw new SignatureException("invalid parallel signature envelope", exception);
-        } catch (Exception exception) {
-            throw new SignatureException("parallel signature verification failed", exception);
+            return verifyCandidate(postQuantum, envelope.postQuantumSignature());
+        } catch (InvalidKeyException exception) {
+            throw new SignatureException("parallel signature key initialization failed", exception);
+        } catch (java.security.GeneralSecurityException exception) {
+            throw new SignatureException("parallel signature provider failure", exception);
         } finally {
             clear(payload);
             message.reset();
@@ -121,6 +131,14 @@ public final class DualSignatureSpi extends SignatureSpi {
     private void ensureCapacity(int additional) throws SignatureException {
         if (additional > MAX_MESSAGE_SIZE - message.size()) {
             throw new SignatureException("message exceeds 64 MiB limit");
+        }
+    }
+
+    private static boolean verifyCandidate(Signature verifier, byte[] candidate) {
+        try {
+            return verifier.verify(candidate);
+        } catch (SignatureException invalidSignatureEncoding) {
+            return false;
         }
     }
 
