@@ -1,0 +1,24 @@
+services:
+  runtime-controller:
+    build:
+      context: .
+      dockerfile: deploy/runtime/Dockerfile
+    command:
+      - -listen=:8090
+      - -data=/var/lib/pqm/runtime.json
+      - -root=/srv/pqm
+      - -emergency-approvers=/run/secrets/approvers.json
+    environment:
+      PQM_RUNTIME_TOKEN: ${PQM_RUNTIME_TOKEN:?set PQM_RUNTIME_TOKEN}
+      PQM_EMERGENCY_PUBLIC_KEY: ${PQM_EMERGENCY_PUBLIC_KEY:?set PQM_EMERGENCY_PUBLIC_KEY}
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ./data/runtime:/var/lib/pqm
+      - ./data/recrypt:/srv/pqm
+      - ./config/approvers.json:/run/secrets/approvers.json:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+mode=${1:-}
+config=${2:-}
+[ -r "$config" ] || { echo 'configuration is not readable' >&2; exit 2; }
+case "$mode" in
+  --check-config)
+    exec swanctl --load-conns --file "$config" --noprompt
+    ;;
+  --config)
+    install -m 0600 "$config" /etc/swanctl/conf.d/pqm-runtime.conf
+    swanctl --load-all --noprompt
+    swanctl --initiate --child pqc-out
+    exec sleep infinity
+    ;;
+  *)
+    echo "usage: $0 --check-config FILE | --config FILE" >&2
+    exit 2
+    ;;
+esac

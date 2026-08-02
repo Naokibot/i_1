@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+case "${USER:-}" in
+  *[!A-Za-z0-9_.-]*|'') echo 'invalid local user' >&2; exit 126 ;;
+esac
+target_file="/etc/pqm/ssh/targets/${USER}"
+[ -r "$target_file" ] || { echo 'no approved upstream mapping' >&2; exit 126; }
+target=$(tr -d '\r\n' < "$target_file")
+case "$target" in
+  *@*:*|*@*) ;;
+  *) echo 'invalid upstream mapping' >&2; exit 126 ;;
+esac
+command=${SSH_ORIGINAL_COMMAND:-}
+if [ -n "$command" ]; then
+  allow_file="/etc/pqm/ssh/allowed-commands/${USER}"
+  [ -r "$allow_file" ] || { echo 'remote commands are not enabled' >&2; exit 126; }
+  if ! grep -Eq -- "$(printf '%s' "$command" | sed 's/[][\\.^$*+?(){}|/]/\\&/g')" "$allow_file"; then
+    echo 'command is not approved' >&2
+    exit 126
+  fi
+  exec /usr/bin/ssh -F /etc/pqm/ssh/ssh_upstream_config -- "$target" "$command"
+fi
+exec /usr/bin/ssh -tt -F /etc/pqm/ssh/ssh_upstream_config -- "$target"
