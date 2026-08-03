@@ -299,6 +299,10 @@ func (c *RolloutController) ExecuteEmergency(rootPublicKey ed25519.PublicKey, ap
 	if err := VerifyEmergencyDirective(rootPublicKey, approverKeys, directive, c.now()); err != nil {
 		return EmergencyDirective{}, err
 	}
+	directive.Status = "reserved"
+	if err := c.store.ReserveDirective(directive, "runtime-controller", "emergency.reserve"); err != nil {
+		return EmergencyDirective{}, err
+	}
 	affected := []string{}
 	for _, deployment := range c.store.ListDeployments() {
 		if !configurationUsesAny(deployment.Stable, directive.AffectedAlgorithms) && (deployment.Candidate == nil || !configurationUsesAny(*deployment.Candidate, directive.AffectedAlgorithms)) {

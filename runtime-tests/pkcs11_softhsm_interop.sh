@@ -33,7 +33,7 @@ softhsm2-util --init-token --free --label pqm-test --so-pin 12345678 --pin 1234 
 
 export PQM_PKCS11_BACKEND="$backend"
 export PQM_PKCS11_AUDIT="$work/audit.jsonl"
-export PQM_PKCS11_ALLOWED_MECHANISMS='CKM_RSA_PKCS_PSS,CKM_SHA256_RSA_PKCS_PSS,CKM_ECDSA,CKM_AES_GCM'
+export PQM_PKCS11_ALLOWED_MECHANISMS='CKM_RSA_PKCS_KEY_PAIR_GEN,CKM_RSA_PKCS_PSS,CKM_SHA256_RSA_PKCS_PSS,CKM_ECDSA,CKM_AES_GCM'
 
 pkcs11-tool --module "$PROXY" --list-slots | grep -q 'pqm-test'
 pkcs11-tool --module "$PROXY" --login --pin 1234 \

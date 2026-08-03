@@ -341,6 +341,11 @@ func decryptChunks(ctx context.Context, input io.Reader, output io.Writer, gcm c
 			return total, err
 		}
 		if length == 0 {
+			if _, err := reader.Peek(1); err == nil {
+				return total, errors.New("trailing data after encrypted payload")
+			} else if !errors.Is(err, io.EOF) {
+				return total, err
+			}
 			break
 		}
 		if length > 64<<20 {

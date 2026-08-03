@@ -132,6 +132,22 @@ func (s *StateStore) PutDirective(d EmergencyDirective, actor, action string) er
 	return s.persistLocked()
 }
 
+func (s *StateStore) ReserveDirective(d EmergencyDirective, actor, action string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.data.Directives[d.ID]; exists {
+		return errors.New("emergency directive has already been processed")
+	}
+	s.data.Directives[d.ID] = d
+	s.appendAuditLocked(actor, action, d.ID, map[string]any{"status": d.Status, "severity": d.Severity})
+	if err := s.persistLocked(); err != nil {
+		delete(s.data.Directives, d.ID)
+		s.data.Audit = s.data.Audit[:len(s.data.Audit)-1]
+		return err
+	}
+	return nil
+}
+
 func (s *StateStore) GetDirective(id string) (EmergencyDirective, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

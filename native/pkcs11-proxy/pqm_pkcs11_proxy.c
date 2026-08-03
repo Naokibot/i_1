@@ -24,6 +24,13 @@ struct mechanism_name {
 };
 
 static const struct mechanism_name mechanism_names[] = {
+    {"CKM_RSA_PKCS_KEY_PAIR_GEN", CKM_RSA_PKCS_KEY_PAIR_GEN},
+#ifdef CKM_EC_KEY_PAIR_GEN
+    {"CKM_EC_KEY_PAIR_GEN", CKM_EC_KEY_PAIR_GEN},
+#endif
+#ifdef CKM_AES_KEY_GEN
+    {"CKM_AES_KEY_GEN", CKM_AES_KEY_GEN},
+#endif
     {"CKM_RSA_PKCS", CKM_RSA_PKCS},
     {"CKM_RSA_PKCS_PSS", CKM_RSA_PKCS_PSS},
     {"CKM_SHA1_RSA_PKCS", CKM_SHA1_RSA_PKCS},

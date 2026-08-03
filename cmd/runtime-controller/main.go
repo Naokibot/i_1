@@ -34,12 +34,17 @@ func main() {
 	dataPath := flag.String("data", envOr("PQM_RUNTIME_DATA", "data/runtime.json"), "runtime state file")
 	root := flag.String("root", envOr("PQM_RUNTIME_ROOT", "."), "allowed root for re-encryption files and keys")
 	token := flag.String("token", os.Getenv("PQM_RUNTIME_TOKEN"), "API bearer token")
+	allowUnauthenticated := flag.Bool("allow-unauthenticated", false, "allow an unauthenticated API; development use only")
 	emergencyPublicKey := flag.String("emergency-public-key", os.Getenv("PQM_EMERGENCY_PUBLIC_KEY"), "base64 Ed25519 emergency root public key")
 	emergencyApprovers := flag.String("emergency-approvers", os.Getenv("PQM_EMERGENCY_APPROVERS"), "JSON file mapping approver names to base64 Ed25519 public keys")
 	opensslBinary := flag.String("openssl", envOr("PQM_OPENSSL", "openssl"), "OpenSSL 3.5 binary")
 	provider := flag.String("provider", envOr("PQM_OPENSSL_PROVIDER", "default"), "OpenSSL provider")
 	providerPath := flag.String("provider-path", os.Getenv("PQM_OPENSSL_PROVIDER_PATH"), "OpenSSL provider module directory")
 	flag.Parse()
+
+	if strings.TrimSpace(*token) == "" && !*allowUnauthenticated {
+		log.Fatal("API bearer token is required; use --allow-unauthenticated only in an isolated development environment")
+	}
 
 	absoluteRoot, err := filepath.Abs(*root)
 	if err != nil {
@@ -370,15 +375,27 @@ func securePath(root, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("path is required")
 	}
-	candidate := path
-	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(root, candidate)
-	}
-	candidate, err := filepath.Abs(candidate)
+	rootPath, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
 	}
-	relative, err := filepath.Rel(root, candidate)
+	rootPath, err = filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve configured root: %w", err)
+	}
+	candidate := path
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(rootPath, candidate)
+	}
+	candidate, err = filepath.Abs(candidate)
+	if err != nil {
+		return "", err
+	}
+	candidate, err = resolveExistingPrefix(candidate)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(rootPath, candidate)
 	if err != nil {
 		return "", err
 	}
@@ -386,6 +403,29 @@ func securePath(root, path string) (string, error) {
 		return "", errors.New("path is outside the configured root")
 	}
 	return candidate, nil
+}
+
+func resolveExistingPrefix(path string) (string, error) {
+	current := filepath.Clean(path)
+	missing := []string{}
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("resolve path: %w", err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("resolve path: %w", err)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
