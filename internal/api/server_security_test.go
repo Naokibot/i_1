@@ -43,7 +43,7 @@ func TestBearerAuthProtectsAPI(t *testing.T) {
 }
 
 func TestDecodeRejectsMultipleJSONValues(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/scans", strings.NewReader(`{"kind":"tls"}{"kind":"ssh"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/scans", strings.NewReader(`{"kind":"tls"}`+`{"kind":"ssh"}`))
 	recorder := httptest.NewRecorder()
 	var value map[string]any
 	if decode(recorder, req, &value) {
