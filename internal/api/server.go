@@ -1,8 +1,10 @@
 package api
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -16,6 +18,8 @@ import (
 	"github.com/Naokibot/i_1/internal/store"
 )
 
+const maxRequestBodyBytes int64 = 1 << 20
+
 //go:embed web/*
 var webFS embed.FS
 
@@ -24,8 +28,16 @@ type server struct {
 	engine *engine.Engine
 }
 
+type Options struct {
+	BearerToken string
+}
+
 func New(st *store.Store, eng *engine.Engine) http.Handler {
-	s := &server{st, eng}
+	return NewWithOptions(st, eng, Options{})
+}
+
+func NewWithOptions(st *store.Store, eng *engine.Engine, options Options) http.Handler {
+	s := &server{store: st, engine: eng}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/health", s.health)
 	mux.HandleFunc("/api/v1/summary", s.summary)
@@ -41,12 +53,27 @@ func New(st *store.Store, eng *engine.Engine) http.Handler {
 	mux.HandleFunc("/api/v1/audit/verify", s.auditVerify)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
-	return requestLog(securityHeaders(mux))
+
+	var handler http.Handler = mux
+	if options.BearerToken != "" {
+		handler = bearerAuth(options.BearerToken, handler)
+	}
+	return requestLog(securityHeaders(handler))
 }
+
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
-	write(w, 200, map[string]any{"status": "ok", "time": time.Now().UTC()})
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
 }
+
 func (s *server) summary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
 	assets := s.store.ListAssets()
 	findings := s.store.ListFindings()
 	levels := map[string]int{}
@@ -59,29 +86,31 @@ func (s *server) summary(w http.ResponseWriter, r *http.Request) {
 	for _, f := range findings {
 		sev[f.Severity]++
 	}
-	write(w, 200, map[string]any{"assetCount": len(assets), "findingCount": len(findings), "riskLevels": levels, "findingSeverities": sev, "pathStatus": paths, "scanCount": len(s.store.ListScans())})
+	write(w, http.StatusOK, map[string]any{"assetCount": len(assets), "findingCount": len(findings), "riskLevels": levels, "findingSeverities": sev, "pathStatus": paths, "scanCount": len(s.store.ListScans())})
 }
+
 func (s *server) assets(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		method(w)
 		return
 	}
-	write(w, 200, s.store.ListAssets())
+	write(w, http.StatusOK, s.store.ListAssets())
 }
+
 func (s *server) asset(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/assets/")
 	parts := strings.Split(path, "/")
 	id := parts[0]
-	if len(parts) == 1 && r.Method == "GET" {
+	if len(parts) == 1 && r.Method == http.MethodGet {
 		a, ok := s.store.GetAsset(id)
 		if !ok {
 			notFound(w)
 			return
 		}
-		write(w, 200, a)
+		write(w, http.StatusOK, a)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "context" && r.Method == "POST" {
+	if len(parts) == 2 && parts[1] == "context" && r.Method == http.MethodPost {
 		var c model.RiskContext
 		if !decode(w, r, &c) {
 			return
@@ -95,32 +124,34 @@ func (s *server) asset(w http.ResponseWriter, r *http.Request) {
 			bad(w, err.Error())
 			return
 		}
-		write(w, 200, a)
+		write(w, http.StatusOK, a)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "recalculate" && r.Method == "POST" {
+	if len(parts) == 2 && parts[1] == "recalculate" && r.Method == http.MethodPost {
 		a, err := s.engine.Recalculate(id)
 		if err != nil {
 			bad(w, err.Error())
 			return
 		}
-		write(w, 200, a)
+		write(w, http.StatusOK, a)
 		return
 	}
 	notFound(w)
 }
+
 func (s *server) findings(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		method(w)
 		return
 	}
-	write(w, 200, s.store.ListFindings())
+	write(w, http.StatusOK, s.store.ListFindings())
 }
+
 func (s *server) scans(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-	case "GET":
-		write(w, 200, s.store.ListScans())
-	case "POST":
+	case http.MethodGet:
+		write(w, http.StatusOK, s.store.ListScans())
+	case http.MethodPost:
 		var req model.ScanRequest
 		if !decode(w, r, &req) {
 			return
@@ -130,13 +161,14 @@ func (s *server) scans(w http.ResponseWriter, r *http.Request) {
 			bad(w, err.Error())
 			return
 		}
-		write(w, 202, j)
+		write(w, http.StatusAccepted, j)
 	default:
 		method(w)
 	}
 }
+
 func (s *server) scan(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		method(w)
 		return
 	}
@@ -146,10 +178,11 @@ func (s *server) scan(w http.ResponseWriter, r *http.Request) {
 		notFound(w)
 		return
 	}
-	write(w, 200, j)
+	write(w, http.StatusOK, j)
 }
+
 func (s *server) cbom(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		method(w)
 		return
 	}
@@ -157,15 +190,17 @@ func (s *server) cbom(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename=observatory.cdx.json")
 	_ = json.NewEncoder(w).Encode(cbom.Generate(s.store.ListAssets()))
 }
+
 func (s *server) capabilities(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		method(w)
 		return
 	}
-	write(w, 200, s.store.ListCapabilities())
+	write(w, http.StatusOK, s.store.ListCapabilities())
 }
+
 func (s *server) capabilityReport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		method(w)
 		return
 	}
@@ -185,8 +220,9 @@ func (s *server) capabilityReport(w http.ResponseWriter, r *http.Request) {
 		bad(w, err.Error())
 		return
 	}
-	write(w, 200, stored)
+	write(w, http.StatusOK, stored)
 }
+
 func classifyCapability(a map[string]bool) string {
 	hasPQC := a["ML-KEM"] || a["ML-DSA"] || a["SLH-DSA"]
 	hasClassical := a["RSA"] || a["ECDSA"] || a["X25519"] || a["ECDH"]
@@ -201,8 +237,9 @@ func classifyCapability(a map[string]bool) string {
 	}
 	return "Unknown"
 }
+
 func (s *server) compilePolicy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		method(w)
 		return
 	}
@@ -215,39 +252,74 @@ func (s *server) compilePolicy(w http.ResponseWriter, r *http.Request) {
 		bad(w, err.Error())
 		return
 	}
-	write(w, 200, c)
+	write(w, http.StatusOK, c)
 }
+
 func (s *server) auditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
 	ok, index, msg := s.store.VerifyAudit()
-	write(w, 200, map[string]any{"valid": ok, "failedIndex": index, "message": msg, "events": len(s.store.AuditEvents())})
+	write(w, http.StatusOK, map[string]any{"valid": ok, "failedIndex": index, "message": msg, "events": len(s.store.AuditEvents())})
 }
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		bad(w, err.Error())
+		bad(w, "invalid JSON request")
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		bad(w, "request body must contain exactly one JSON value")
 		return false
 	}
 	return true
 }
+
+func bearerAuth(token string, next http.Handler) http.Handler {
+	expected := []byte(token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), expected) != 1 {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="pqm-observatory"`)
+				write(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func bad(w http.ResponseWriter, msg string) { write(w, 400, map[string]string{"error": msg}) }
-func notFound(w http.ResponseWriter)        { write(w, 404, map[string]string{"error": "not found"}) }
-func method(w http.ResponseWriter)          { write(w, 405, map[string]string{"error": "method not allowed"}) }
+
+func bad(w http.ResponseWriter, msg string) { write(w, http.StatusBadRequest, map[string]string{"error": msg}) }
+func notFound(w http.ResponseWriter)        { write(w, http.StatusNotFound, map[string]string{"error": "not found"}) }
+func method(w http.ResponseWriter)          { write(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"}) }
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		next.ServeHTTP(w, r)
 	})
 }
+
 func requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
