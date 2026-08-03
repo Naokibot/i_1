@@ -25,3 +25,9 @@ jobs:
           govulncheck ./...
       - name: Build observer
         run: go build ./cmd/observer
+      - name: Validate Docker Compose security configuration
+        env:
+          PQM_API_TOKEN: 0123456789abcdef0123456789abcdef
+        run: docker compose config --quiet
+      - name: Build hardened observer container
+        run: docker build --pull --tag pqm-observer:test .
