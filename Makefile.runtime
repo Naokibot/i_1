@@ -1,0 +1,21 @@
+.PHONY: runtime-test runtime-build native-build java-test runtime-smoke
+runtime-test:
+	go test -race ./...
+	go vet ./...
+runtime-build:
+	mkdir -p bin
+	go build -o bin/runtime-controller ./cmd/runtime-controller
+	go build -o bin/gateway-agent ./cmd/gateway-agent
+	go build -o bin/telemetry-reporter ./cmd/telemetry-reporter
+	go build -o bin/recrypt-worker ./cmd/recrypt-worker
+	go build -o bin/emergency-sign ./cmd/emergency-sign
+native-build:
+	cmake -S native/tls-gateway -B build/tls -DCMAKE_BUILD_TYPE=Release
+	cmake --build build/tls
+	cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
+	cmake --build build/pkcs11
+java-test:
+	cd java/migration-provider && gradle test
+runtime-smoke: native-build
+	GATEWAY=./build/tls/pqm-tls-gateway ./runtime-tests/tls_gateway_smoke.sh
+	./runtime-tests/recrypt_smoke.sh
