@@ -70,7 +70,7 @@ jobs:
       - name: Install build and interoperability dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake gcc make ninja-build perl libp11-kit-dev softhsm2 opensc python3
+          sudo apt-get install -y cmake gcc make ninja-build perl libp11-kit-dev softhsm2 opensc python3 openssh-client openssh-server
       - name: Build verified OpenSSL 3.5 release
         shell: bash
         run: |
@@ -156,6 +156,9 @@ jobs:
         env:
           PROXY: ./build/pkcs11/libpqm-pkcs11.so
         run: bash runtime-tests/pkcs11_softhsm_interop.sh
+      - name: Validate SSH relay and VPN switching policies
+        shell: bash
+        run: bash runtime-tests/ssh_vpn_security.sh
 
   java:
     name: Java migration provider
