@@ -73,6 +73,65 @@ func TestEmergencyDirectiveRejectsTamperingExpiryAndDuplicateApproval(t *testing
 	}
 }
 
+func TestEmergencyDirectiveReplayIsRejected(t *testing.T) {
+	rootPublic, rootPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alicePublic, alicePrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobPublic, bobPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := NewRolloutController(store)
+	now := time.Now().UTC()
+	controller.now = func() time.Time { return now }
+	_, err = controller.CreateDeployment("payments", GatewayConfig{
+		Revision: "r1",
+		Kind:     "tls",
+		Listen:   ":8443",
+		Upstream: "payments:443",
+		Groups:   []string{"X25519MLKEM768"},
+	}, Thresholds{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directive := EmergencyDirective{
+		ID:                 "one-time-directive",
+		IssuedAt:           now.Add(-time.Minute),
+		ExpiresAt:          now.Add(time.Hour),
+		Severity:           "critical",
+		AffectedAlgorithms: []string{"X25519MLKEM768"},
+		ReplacementGroups:  []string{"SecP384r1MLKEM1024"},
+	}
+	directive, err = SignEmergencyDirective(rootPrivate, directive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directive, err = SignEmergencyApproval(alicePrivate, "alice", directive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directive, err = SignEmergencyApproval(bobPrivate, "bob", directive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvers := map[string]ed25519.PublicKey{"alice": alicePublic, "bob": bobPublic}
+	if _, err := controller.ExecuteEmergency(rootPublic, approvers, directive); err != nil {
+		t.Fatalf("first execution failed: %v", err)
+	}
+	if _, err := controller.ExecuteEmergency(rootPublic, approvers, directive); err == nil {
+		t.Fatal("replayed emergency directive was accepted")
+	}
+}
+
 func TestAuditChainDetectsPersistedTampering(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	store, err := OpenStateStore(path)
