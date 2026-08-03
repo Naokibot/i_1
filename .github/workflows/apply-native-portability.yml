@@ -1,3 +1,4 @@
+# One-time reviewed source patch; remove after successful application.
 name: apply-native-portability
 
 on:
