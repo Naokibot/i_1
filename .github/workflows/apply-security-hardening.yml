@@ -1,0 +1,225 @@
+name: apply-security-hardening
+
+on:
+  push:
+    branches:
+      - agent/pqm-runtime-platform
+    paths:
+      - '.github/workflows/apply-security-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: agent/pqm-runtime-platform
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Apply reviewed hardening changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              target.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "internal/runtime/recrypt.go",
+              "\t\tif length == 0 {\n\t\t\tbreak\n\t\t}\n",
+              "\t\tif length == 0 {\n"
+              "\t\t\tif _, err := reader.Peek(1); err == nil {\n"
+              "\t\t\t\treturn total, errors.New(\"trailing data after encrypted payload\")\n"
+              "\t\t\t} else if !errors.Is(err, io.EOF) {\n"
+              "\t\t\t\treturn total, err\n"
+              "\t\t\t}\n"
+              "\t\t\tbreak\n"
+              "\t\t}\n",
+          )
+
+          replace_once(
+              "native/pkcs11-proxy/pqm_pkcs11_proxy.c",
+              "static const struct mechanism_name mechanism_names[] = {\n"
+              "    {\"CKM_RSA_PKCS\", CKM_RSA_PKCS},\n",
+              "static const struct mechanism_name mechanism_names[] = {\n"
+              "    {\"CKM_RSA_PKCS_KEY_PAIR_GEN\", CKM_RSA_PKCS_KEY_PAIR_GEN},\n"
+              "#ifdef CKM_EC_KEY_PAIR_GEN\n"
+              "    {\"CKM_EC_KEY_PAIR_GEN\", CKM_EC_KEY_PAIR_GEN},\n"
+              "#endif\n"
+              "#ifdef CKM_AES_KEY_GEN\n"
+              "    {\"CKM_AES_KEY_GEN\", CKM_AES_KEY_GEN},\n"
+              "#endif\n"
+              "    {\"CKM_RSA_PKCS\", CKM_RSA_PKCS},\n",
+          )
+
+          replace_once(
+              "runtime-tests/pkcs11_softhsm_interop.sh",
+              "export PQM_PKCS11_ALLOWED_MECHANISMS='CKM_RSA_PKCS_PSS,CKM_SHA256_RSA_PKCS_PSS,CKM_ECDSA,CKM_AES_GCM'",
+              "export PQM_PKCS11_ALLOWED_MECHANISMS='CKM_RSA_PKCS_KEY_PAIR_GEN,CKM_RSA_PKCS_PSS,CKM_SHA256_RSA_PKCS_PSS,CKM_ECDSA,CKM_AES_GCM'",
+          )
+
+          replace_once(
+              "cmd/runtime-controller/main.go",
+              "\ttoken := flag.String(\"token\", os.Getenv(\"PQM_RUNTIME_TOKEN\"), \"API bearer token\")\n",
+              "\ttoken := flag.String(\"token\", os.Getenv(\"PQM_RUNTIME_TOKEN\"), \"API bearer token\")\n"
+              "\tallowUnauthenticated := flag.Bool(\"allow-unauthenticated\", false, \"allow an unauthenticated API; development use only\")\n",
+          )
+          replace_once(
+              "cmd/runtime-controller/main.go",
+              "\tflag.Parse()\n\n\tabsoluteRoot, err := filepath.Abs(*root)\n",
+              "\tflag.Parse()\n\n"
+              "\tif strings.TrimSpace(*token) == \"\" && !*allowUnauthenticated {\n"
+              "\t\tlog.Fatal(\"API bearer token is required; use --allow-unauthenticated only in an isolated development environment\")\n"
+              "\t}\n\n"
+              "\tabsoluteRoot, err := filepath.Abs(*root)\n",
+          )
+
+          old_secure_path = '''func securePath(root, path string) (string, error) {
+          \tif strings.TrimSpace(path) == "" {
+          \t\treturn "", errors.New("path is required")
+          \t}
+          \tcandidate := path
+          \tif !filepath.IsAbs(candidate) {
+          \t\tcandidate = filepath.Join(root, candidate)
+          \t}
+          \tcandidate, err := filepath.Abs(candidate)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \trelative, err := filepath.Rel(root, candidate)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \tif relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+          \t\treturn "", errors.New("path is outside the configured root")
+          \t}
+          \treturn candidate, nil
+          }
+          '''
+          new_secure_path = '''func securePath(root, path string) (string, error) {
+          \tif strings.TrimSpace(path) == "" {
+          \t\treturn "", errors.New("path is required")
+          \t}
+          \trootPath, err := filepath.Abs(root)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \trootPath, err = filepath.EvalSymlinks(rootPath)
+          \tif err != nil {
+          \t\treturn "", fmt.Errorf("resolve configured root: %w", err)
+          \t}
+          \tcandidate := path
+          \tif !filepath.IsAbs(candidate) {
+          \t\tcandidate = filepath.Join(rootPath, candidate)
+          \t}
+          \tcandidate, err = filepath.Abs(candidate)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \tcandidate, err = resolveExistingPrefix(candidate)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \trelative, err := filepath.Rel(rootPath, candidate)
+          \tif err != nil {
+          \t\treturn "", err
+          \t}
+          \tif relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+          \t\treturn "", errors.New("path is outside the configured root")
+          \t}
+          \treturn candidate, nil
+          }
+
+          func resolveExistingPrefix(path string) (string, error) {
+          \tcurrent := filepath.Clean(path)
+          \tmissing := []string{}
+          \tfor {
+          \t\tresolved, err := filepath.EvalSymlinks(current)
+          \t\tif err == nil {
+          \t\t\tfor i := len(missing) - 1; i >= 0; i-- {
+          \t\t\t\tresolved = filepath.Join(resolved, missing[i])
+          \t\t\t}
+          \t\t\treturn filepath.Clean(resolved), nil
+          \t\t}
+          \t\tif !errors.Is(err, os.ErrNotExist) {
+          \t\t\treturn "", fmt.Errorf("resolve path: %w", err)
+          \t\t}
+          \t\tparent := filepath.Dir(current)
+          \t\tif parent == current {
+          \t\t\treturn "", fmt.Errorf("resolve path: %w", err)
+          \t\t}
+          \t\tmissing = append(missing, filepath.Base(current))
+          \t\tcurrent = parent
+          \t}
+          }
+          '''
+          replace_once("cmd/runtime-controller/main.go", old_secure_path, new_secure_path)
+
+          replace_once(
+              "internal/runtime/store.go",
+              '''func (s *StateStore) GetDirective(id string) (EmergencyDirective, bool) {
+          ''',
+              '''func (s *StateStore) ReserveDirective(d EmergencyDirective, actor, action string) error {
+          \ts.mu.Lock()
+          \tdefer s.mu.Unlock()
+          \tif _, exists := s.data.Directives[d.ID]; exists {
+          \t\treturn errors.New("emergency directive has already been processed")
+          \t}
+          \ts.data.Directives[d.ID] = d
+          \ts.appendAuditLocked(actor, action, d.ID, map[string]any{"status": d.Status, "severity": d.Severity})
+          \tif err := s.persistLocked(); err != nil {
+          \t\tdelete(s.data.Directives, d.ID)
+          \t\ts.data.Audit = s.data.Audit[:len(s.data.Audit)-1]
+          \t\treturn err
+          \t}
+          \treturn nil
+          }
+
+          func (s *StateStore) GetDirective(id string) (EmergencyDirective, bool) {
+          ''',
+          )
+
+          replace_once(
+              "internal/runtime/rollout.go",
+              '''func (c *RolloutController) ExecuteEmergency(rootPublicKey ed25519.PublicKey, approverKeys map[string]ed25519.PublicKey, directive EmergencyDirective) (EmergencyDirective, error) {
+          \tif err := VerifyEmergencyDirective(rootPublicKey, approverKeys, directive, c.now()); err != nil {
+          \t\treturn EmergencyDirective{}, err
+          \t}
+          \taffected := []string{}
+          ''',
+              '''func (c *RolloutController) ExecuteEmergency(rootPublicKey ed25519.PublicKey, approverKeys map[string]ed25519.PublicKey, directive EmergencyDirective) (EmergencyDirective, error) {
+          \tif err := VerifyEmergencyDirective(rootPublicKey, approverKeys, directive, c.now()); err != nil {
+          \t\treturn EmergencyDirective{}, err
+          \t}
+          \tdirective.Status = "reserved"
+          \tif err := c.store.ReserveDirective(directive, "runtime-controller", "emergency.reserve"); err != nil {
+          \t\treturn EmergencyDirective{}, err
+          \t}
+          \taffected := []string{}
+          ''',
+          )
+          PY
+          gofmt -w cmd/runtime-controller/main.go internal/runtime/recrypt.go internal/runtime/rollout.go internal/runtime/store.go
+          git diff --check
+      - name: Commit hardening changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'pqm-security-bot'
+          git config user.email 'pqm-security-bot@users.noreply.github.com'
+          git add cmd/runtime-controller/main.go internal/runtime/recrypt.go internal/runtime/rollout.go internal/runtime/store.go native/pkcs11-proxy/pqm_pkcs11_proxy.c runtime-tests/pkcs11_softhsm_interop.sh
+          git commit -m 'fix(security): reject replay, path escape, trailing data and unauthenticated startup'
+          git push origin HEAD:agent/pqm-runtime-platform
