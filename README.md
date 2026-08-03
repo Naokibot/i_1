@@ -18,7 +18,8 @@ A runnable MVP for the first stage of a crypto-agile migration platform. It disc
 - JSON crypto-policy compiler
 - SHA-256 hash-chained audit events and verification endpoint
 - Responsive embedded dashboard and REST API
-- Docker image, Compose file, tests, vet/build CI
+- Loopback-only default listener, optional bearer authentication, bounded HTTP requests, and bounded scan concurrency
+- Docker image, Compose file, race-enabled tests, vet/build CI, and reachable Go vulnerability scanning
 
 ## Run
 
@@ -26,12 +27,19 @@ A runnable MVP for the first stage of a crypto-agile migration platform. It disc
 make run
 ```
 
-Open `http://localhost:8080`.
+Open `http://127.0.0.1:8080`.
 
-The source scanner only accepts paths under `-source-root`. The default is the current directory.
+The source scanner only accepts paths under `-source-root`. The default is the current directory. The observer binds to loopback by default so a local development run does not require an API token.
 
 ```bash
-go run ./cmd/observer -listen=:8080 -data=data/observatory.json -source-root=.
+go run ./cmd/observer -listen=127.0.0.1:8080 -data=data/observatory.json -source-root=.
+```
+
+A non-loopback listener requires a bearer token containing at least 32 characters. Put TLS in front of the service before allowing access from another host; bearer tokens must not be sent over an unencrypted network.
+
+```bash
+PQM_API_TOKEN="$(openssl rand -hex 32)" \
+  go run ./cmd/observer -listen=0.0.0.0:8080 -data=data/observatory.json -source-root=.
 ```
 
 Try the included legacy sample from the dashboard with:
@@ -41,10 +49,10 @@ kind: source
 target: samples/legacy-java
 ```
 
-Or use the API:
+Or use the local API:
 
 ```bash
-curl -sS http://localhost:8080/api/v1/scans \
+curl -sS http://127.0.0.1:8080/api/v1/scans \
   -H 'content-type: application/json' \
   -d '{
     "kind":"tls",
@@ -59,6 +67,8 @@ curl -sS http://localhost:8080/api/v1/scans \
     "harvestNowRisk":"high"
   }'
 ```
+
+For a token-protected deployment, add `-H "Authorization: Bearer $PQM_API_TOKEN"` to API requests. The dashboard requests the token and retains it only in browser session storage.
 
 The scan is asynchronous. Poll `/api/v1/scans/{scanId}` and read the resulting `assetId`.
 
@@ -78,11 +88,11 @@ The scan is asynchronous. Poll `/api/v1/scans/{scanId}` and read the resulting `
 ## Capability regression example
 
 ```bash
-curl -sS http://localhost:8080/api/v1/capabilities/report \
+curl -sS http://127.0.0.1:8080/api/v1/capabilities/report \
   -H 'content-type: application/json' \
   -d '{"subject":"payments.example","algorithms":{"RSA":true,"X25519":true,"ML-KEM":true}}'
 
-curl -sS http://localhost:8080/api/v1/capabilities/report \
+curl -sS http://127.0.0.1:8080/api/v1/capabilities/report \
   -H 'content-type: application/json' \
   -d '{"subject":"payments.example","algorithms":{"RSA":true}}'
 ```
@@ -92,7 +102,7 @@ The second report is marked `downgradeSuspect: true`.
 ## Policy compiler
 
 ```bash
-curl -sS http://localhost:8080/api/v1/policy/compile \
+curl -sS http://127.0.0.1:8080/api/v1/policy/compile \
   -H 'content-type: application/json' \
   --data-binary @config/example-policy.json
 ```
@@ -101,11 +111,14 @@ The compiler always emits an explicit warning when a temporary gateway is allowe
 
 ## Docker
 
+Generate a token, then start the service:
+
 ```bash
+export PQM_API_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build
 ```
 
-The repository is mounted read-only at `/workspace`, so source targets are paths relative to the repository root.
+Compose publishes the service only on host loopback at `127.0.0.1:8080`, drops Linux capabilities, enables `no-new-privileges`, and uses a read-only root filesystem. The repository is mounted read-only at `/workspace`, so source targets are paths relative to the repository root.
 
 ## Architecture
 
@@ -129,8 +142,9 @@ Embedded Go control plane
 - The SSH scanner observes server proposals only; it does not authenticate or alter the server.
 - Pattern-based source discovery produces leads, not proof that a code path is reachable.
 - JSON persistence is intended for a single-node MVP. The next deployment step should replace it with PostgreSQL plus a graph store and authenticated multi-tenant APIs.
+- The SHA-256 audit chain can detect accidental or unsophisticated edits, but it is not a keyed or externally anchored tamper-proof ledger.
 - CBOM export uses CycloneDX 1.7 cryptographic asset objects. Validate generated output as part of a production release process.
-- No runtime hook, HSM, PKCS#11 proxy, data re-encryption worker, TLS gateway, or automatic rollback actuator is included yet.
+- Runtime gateway, PKCS#11, re-encryption, SSH, and VPN components remain experimental and require the separate runtime validation workflows and production hardening review.
 
 ## Recommended next milestones
 
@@ -138,5 +152,5 @@ Embedded Go control plane
 2. Add passive ClientHello and SSH telemetry ingestion with privacy controls.
 3. Add repository/CI scanning and binary/OID extraction.
 4. Validate every CBOM with the official CycloneDX JSON schema in CI.
-5. Build a separate OpenSSL 3.5 gateway experiment using a provider boundary; keep experimental algorithms outside this control-plane binary.
-6. Add canary policy, health thresholds, and rollback orchestration before any traffic-changing feature.
+5. Require signed desired state, pinned gateway binaries, mTLS controller enrollment, and replay protection for gateway agents.
+6. Add strict upstream identity checks, connection quotas, health thresholds, and rollback orchestration before any production traffic change.
