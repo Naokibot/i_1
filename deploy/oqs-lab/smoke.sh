@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+module=$(find /opt/oqs-provider -type f -name 'oqsprovider.so' -print -quit)
+if [ -z "$module" ]; then
+  echo 'oqsprovider.so was not installed' >&2
+  exit 1
+fi
+OPENSSL_MODULES=$(dirname "$module")
+export OPENSSL_MODULES
+
 work=$(mktemp -d)
 server_pid=
 cleanup() {
