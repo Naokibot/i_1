@@ -14,7 +14,7 @@ command=${SSH_ORIGINAL_COMMAND:-}
 if [ -n "$command" ]; then
   allow_file="/etc/pqm/ssh/allowed-commands/${USER}"
   [ -r "$allow_file" ] || { echo 'remote commands are not enabled' >&2; exit 126; }
-  if ! grep -Eq -- "$(printf '%s' "$command" | sed 's/[][\\.^$*+?(){}|/]/\\&/g')" "$allow_file"; then
+  if ! grep -Fxq -- "$command" "$allow_file"; then
     echo 'command is not approved' >&2
     exit 126
   fi
