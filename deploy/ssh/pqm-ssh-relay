@@ -5,13 +5,21 @@ case "${USER:-}" in
 esac
 target_file="/etc/pqm/ssh/targets/${USER}"
 [ -r "$target_file" ] || { echo 'no approved upstream mapping' >&2; exit 126; }
-target=$(tr -d '\r\n' < "$target_file")
+target=$(cat "$target_file")
+if [ -z "$target" ] || [ "${#target}" -gt 512 ] || printf '%s' "$target" | LC_ALL=C grep -q '[[:cntrl:][:space:]]'; then
+  echo 'invalid upstream mapping' >&2
+  exit 126
+fi
 case "$target" in
   *@*:*|*@*) ;;
   *) echo 'invalid upstream mapping' >&2; exit 126 ;;
 esac
 command=${SSH_ORIGINAL_COMMAND:-}
 if [ -n "$command" ]; then
+  if [ "${#command}" -gt 4096 ] || printf '%s' "$command" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    echo 'invalid remote command' >&2
+    exit 126
+  fi
   allow_file="/etc/pqm/ssh/allowed-commands/${USER}"
   [ -r "$allow_file" ] || { echo 'remote commands are not enabled' >&2; exit 126; }
   if ! grep -Fxq -- "$command" "$allow_file"; then
