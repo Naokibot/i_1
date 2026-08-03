@@ -1,0 +1,15 @@
+{
+  "dataClassification": "medical-record",
+  "retentionPeriod": "20-years",
+  "requirements": {
+    "keyExchange": { "minimum": "hybrid-pqc" },
+    "signature": { "minimum": "dual-signature" },
+    "storage": { "pqcKeyWrapping": "required" }
+  },
+  "exceptions": {
+    "legacyDevices": {
+      "temporaryGateway": "allowed",
+      "deadline": "2028-03-31"
+    }
+  }
+}

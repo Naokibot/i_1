@@ -1,0 +1,13 @@
+{
+  "id": "crypto-emergency-2026-001",
+  "issuedAt": "2026-08-03T00:00:00Z",
+  "expiresAt": "2026-08-04T00:00:00Z",
+  "severity": "critical",
+  "affectedAlgorithms": ["X25519MLKEM768"],
+  "replacementGroups": ["SecP384r1MLKEM1024"],
+  "minimumVersion": "3.5.7",
+  "fallbackAllowed": false,
+  "approvals": [],
+  "signature": "",
+  "status": ""
+}
