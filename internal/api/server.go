@@ -305,9 +305,15 @@ func write(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func bad(w http.ResponseWriter, msg string) { write(w, http.StatusBadRequest, map[string]string{"error": msg}) }
-func notFound(w http.ResponseWriter)        { write(w, http.StatusNotFound, map[string]string{"error": "not found"}) }
-func method(w http.ResponseWriter)          { write(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"}) }
+func bad(w http.ResponseWriter, msg string) {
+	write(w, http.StatusBadRequest, map[string]string{"error": msg})
+}
+func notFound(w http.ResponseWriter) {
+	write(w, http.StatusNotFound, map[string]string{"error": "not found"})
+}
+func method(w http.ResponseWriter) {
+	write(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+}
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
