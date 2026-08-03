@@ -12,6 +12,7 @@ on:
       - 'java/migration-provider/**'
       - 'runtime-tests/**'
       - 'deploy/**'
+      - 'docs/**'
       - '.github/workflows/runtime.yml'
   pull_request:
     paths:
@@ -21,6 +22,7 @@ on:
       - 'java/migration-provider/**'
       - 'runtime-tests/**'
       - 'deploy/**'
+      - 'docs/**'
       - '.github/workflows/runtime.yml'
   workflow_dispatch:
 
@@ -56,18 +58,20 @@ jobs:
         run: go build ./cmd/runtime-controller ./cmd/gateway-agent ./cmd/telemetry-reporter ./cmd/recrypt-worker ./cmd/emergency-sign
 
   native:
-    name: OpenSSL and PKCS#11 data plane
+    name: OpenSSL, TLS and PKCS#11 validation
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: '1.23.x'
           cache: false
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake gcc make perl libp11-kit-dev
-      - name: Build verified OpenSSL 3.5 LTS release
+      - name: Install build and interoperability dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc make ninja-build perl libp11-kit-dev softhsm2 opensc python3
+      - name: Build verified OpenSSL 3.5 release
         shell: bash
         run: |
           set -euo pipefail
@@ -80,9 +84,18 @@ jobs:
           ./Configure --prefix="${OPENSSL_ROOT}" --openssldir="${OPENSSL_ROOT}/ssl" shared no-tests
           make -j2
           sudo make install_sw
-          echo "${OPENSSL_ROOT}/lib64" | sudo tee /etc/ld.so.conf.d/openssl-3.5.conf
+          libdir="${OPENSSL_ROOT}/lib64"
+          if [[ ! -f "${libdir}/libssl.so" ]]; then
+            libdir="${OPENSSL_ROOT}/lib"
+          fi
+          test -f "${libdir}/libssl.so"
+          test -f "${libdir}/libcrypto.so"
+          echo "OPENSSL_LIBDIR=${libdir}" >>"${GITHUB_ENV}"
+          echo "${libdir}" | sudo tee /etc/ld.so.conf.d/openssl-3.5.conf
           sudo ldconfig
-          "${OPENSSL_ROOT}/bin/openssl" version
+          "${OPENSSL_ROOT}/bin/openssl" version -a
+          "${OPENSSL_ROOT}/bin/openssl" list -kem-algorithms | grep -q 'ML-KEM-768'
+          "${OPENSSL_ROOT}/bin/openssl" list -tls1_3 -tls-groups | grep -q 'X25519MLKEM768'
       - name: Configure TLS gateway against OpenSSL 3.5
         shell: bash
         env:
@@ -91,32 +104,58 @@ jobs:
           PKG_CONFIG_PATH: /opt/openssl-3.5/lib64/pkgconfig:/opt/openssl-3.5/lib/pkgconfig
         run: |
           set -euo pipefail
-          cmake -S native/tls-gateway -B build/tls \
-            -DCMAKE_BUILD_TYPE=Release \
+          cmake -S native/tls-gateway -B build/tls -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
             -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}" \
             -DOPENSSL_INCLUDE_DIR="${OPENSSL_ROOT}/include" \
-            -DOPENSSL_SSL_LIBRARY="${OPENSSL_ROOT}/lib64/libssl.so" \
-            -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_ROOT}/lib64/libcrypto.so"
+            -DOPENSSL_SSL_LIBRARY="${OPENSSL_LIBDIR}/libssl.so" \
+            -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_LIBDIR}/libcrypto.so"
           grep -E 'OPENSSL_(INCLUDE_DIR|SSL_LIBRARY|CRYPTO_LIBRARY):' build/tls/CMakeCache.txt
-      - name: Build TLS gateway with strict warnings
+      - name: Build TLS gateway with strict warnings and sanitizers
         run: cmake --build build/tls --parallel 2 --verbose
-      - name: Configure PKCS#11 proxy
-        run: cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
-      - name: Build PKCS#11 proxy with strict warnings
-        run: cmake --build build/pkcs11 --parallel 2 --verbose
+      - name: Configure and build PKCS#11 proxy
+        run: |
+          cmake -S native/pkcs11-proxy -B build/pkcs11 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/pkcs11 --parallel 2 --verbose
       - name: Exercise hybrid TLS gateway
         shell: bash
         env:
           PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
           LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           GATEWAY: ./build/tls/pqm-tls-gateway
-        run: ./runtime-tests/tls_gateway_smoke.sh
+        run: bash runtime-tests/tls_gateway_smoke.sh
+      - name: Run adversarial TLS validation
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          GATEWAY: ./build/tls/pqm-tls-gateway
+          OPENSSL: /opt/openssl-3.5/bin/openssl
+        run: bash runtime-tests/tls_gateway_security.sh
       - name: Exercise ML-KEM envelope encryption
         shell: bash
         env:
           PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
           LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
-        run: ./runtime-tests/recrypt_smoke.sh
+        run: bash runtime-tests/recrypt_smoke.sh
+      - name: Run adversarial envelope validation
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          OPENSSL: /opt/openssl-3.5/bin/openssl
+        run: bash runtime-tests/recrypt_adversarial.sh
+      - name: Exercise PKCS#11 proxy with SoftHSM2
+        shell: bash
+        env:
+          PROXY: ./build/pkcs11/libpqm-pkcs11.so
+        run: bash runtime-tests/pkcs11_softhsm_interop.sh
 
   java:
     name: Java migration provider
