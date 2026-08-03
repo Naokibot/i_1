@@ -2,6 +2,8 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <p11-kit/pkcs11.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -9,7 +11,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 static pthread_mutex_t proxy_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t audit_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -82,8 +90,17 @@ static bool token_contains(const char *list, const char *token) {
     return false;
 }
 
+static bool environment_true(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL &&
+           (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 || strcasecmp(value, "yes") == 0);
+}
+
 static bool mechanism_allowed(CK_MECHANISM_TYPE mechanism) {
     const char *name = mechanism_name(mechanism);
+    if (strcmp(name, "UNKNOWN") == 0 && !environment_true("PQM_PKCS11_ALLOW_UNKNOWN_MECHANISMS")) {
+        return false;
+    }
     const char *allowed = getenv("PQM_PKCS11_ALLOWED_MECHANISMS");
     if (allowed != NULL && *allowed != '\0') {
         return token_contains(allowed, name);
@@ -95,13 +112,34 @@ static bool mechanism_allowed(CK_MECHANISM_TYPE mechanism) {
     return !token_contains(denied, name);
 }
 
+static FILE *open_audit_file(const char *path) {
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        return NULL;
+    }
+    struct stat info;
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != geteuid()) {
+        close(fd);
+        return NULL;
+    }
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        close(fd);
+        return NULL;
+    }
+    FILE *file = fdopen(fd, "a");
+    if (file == NULL) {
+        close(fd);
+    }
+    return file;
+}
+
 static void write_audit(const char *operation, CK_SESSION_HANDLE session, CK_MECHANISM_TYPE mechanism, CK_RV result) {
     const char *path = getenv("PQM_PKCS11_AUDIT");
     if (path == NULL || *path == '\0') {
         path = "pkcs11-audit.jsonl";
     }
     pthread_mutex_lock(&audit_lock);
-    FILE *file = fopen(path, "ab");
+    FILE *file = open_audit_file(path);
     if (file != NULL) {
         char timestamp[64];
         time_t now = time(NULL);
@@ -122,6 +160,27 @@ static void write_audit(const char *operation, CK_SESSION_HANDLE session, CK_MEC
     pthread_mutex_unlock(&audit_lock);
 }
 
+static CK_RV validate_backend_path(const char *path, char resolved[PATH_MAX]) {
+    if (path == NULL || *path == '\0' || path[0] != '/') {
+        return CKR_ARGUMENTS_BAD;
+    }
+    if (realpath(path, resolved) == NULL) {
+        return CKR_GENERAL_ERROR;
+    }
+    struct stat info;
+    if (stat(resolved, &info) != 0 || !S_ISREG(info.st_mode)) {
+        return CKR_GENERAL_ERROR;
+    }
+    uid_t effective_uid = geteuid();
+    if (info.st_uid != 0 && info.st_uid != effective_uid) {
+        return CKR_GENERAL_ERROR;
+    }
+    if ((info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return CKR_GENERAL_ERROR;
+    }
+    return CKR_OK;
+}
+
 static CK_RV load_backend(void) {
     pthread_mutex_lock(&proxy_lock);
     if (proxy_ready) {
@@ -129,11 +188,13 @@ static CK_RV load_backend(void) {
         return CKR_OK;
     }
     const char *path = getenv("PQM_PKCS11_BACKEND");
-    if (path == NULL || *path == '\0') {
+    char resolved[PATH_MAX];
+    CK_RV validation = validate_backend_path(path, resolved);
+    if (validation != CKR_OK) {
         pthread_mutex_unlock(&proxy_lock);
-        return CKR_ARGUMENTS_BAD;
+        return validation;
     }
-    backend_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    backend_handle = dlopen(resolved, RTLD_NOW | RTLD_LOCAL);
     if (backend_handle == NULL) {
         pthread_mutex_unlock(&proxy_lock);
         return CKR_GENERAL_ERROR;
@@ -159,6 +220,15 @@ static CK_RV load_backend(void) {
     memcpy(&proxy, backend, sizeof(proxy));
     proxy_ready = true;
     pthread_mutex_unlock(&proxy_lock);
+    return CKR_OK;
+}
+
+static CK_RV check_mechanism(const char *operation, CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism) {
+    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
+        CK_RV result = CKR_MECHANISM_INVALID;
+        write_audit(operation, session, mechanism == NULL ? 0 : mechanism->mechanism, result);
+        return result;
+    }
     return CKR_OK;
 }
 
@@ -191,6 +261,9 @@ CK_RV C_GetMechanismList(CK_SLOT_ID slot_id, CK_MECHANISM_TYPE_PTR mechanisms, C
     CK_RV result = load_backend();
     if (result != CKR_OK) {
         return result;
+    }
+    if (count == NULL) {
+        return CKR_ARGUMENTS_BAD;
     }
     CK_ULONG backend_count = 0;
     result = backend->C_GetMechanismList(slot_id, NULL, &backend_count);
@@ -239,16 +312,41 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slot_id, CK_MECHANISM_TYPE type, CK_MECHANIS
     return backend->C_GetMechanismInfo(slot_id, type, info);
 }
 
+CK_RV C_EncryptInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_EncryptInit", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_EncryptInit(session, mechanism, key);
+    write_audit("C_EncryptInit", session, mechanism->mechanism, result);
+    return result;
+}
+
+CK_RV C_DecryptInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_DecryptInit", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_DecryptInit(session, mechanism, key);
+    write_audit("C_DecryptInit", session, mechanism->mechanism, result);
+    return result;
+}
+
+CK_RV C_DigestInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_DigestInit", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_DigestInit(session, mechanism);
+    write_audit("C_DigestInit", session, mechanism->mechanism, result);
+    return result;
+}
+
 CK_RV C_SignInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
-    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
-        result = CKR_MECHANISM_INVALID;
-        write_audit("C_SignInit", session, mechanism == NULL ? 0 : mechanism->mechanism, result);
-        return result;
-    }
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_SignInit", session, mechanism);
+    if (result != CKR_OK) return result;
     result = backend->C_SignInit(session, mechanism, key);
     write_audit("C_SignInit", session, mechanism->mechanism, result);
     return result;
@@ -256,26 +354,53 @@ CK_RV C_SignInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJEC
 
 CK_RV C_Sign(CK_SESSION_HANDLE session, CK_BYTE_PTR data, CK_ULONG data_length, CK_BYTE_PTR signature, CK_ULONG_PTR signature_length) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
+    if (result != CKR_OK) return result;
     result = backend->C_Sign(session, data, data_length, signature, signature_length);
     write_audit("C_Sign", session, 0, result);
     return result;
 }
 
+CK_RV C_SignRecoverInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_SignRecoverInit", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_SignRecoverInit(session, mechanism, key);
+    write_audit("C_SignRecoverInit", session, mechanism->mechanism, result);
+    return result;
+}
+
 CK_RV C_VerifyInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
-    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
-        result = CKR_MECHANISM_INVALID;
-        write_audit("C_VerifyInit", session, mechanism == NULL ? 0 : mechanism->mechanism, result);
-        return result;
-    }
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_VerifyInit", session, mechanism);
+    if (result != CKR_OK) return result;
     result = backend->C_VerifyInit(session, mechanism, key);
     write_audit("C_VerifyInit", session, mechanism->mechanism, result);
+    return result;
+}
+
+CK_RV C_VerifyRecoverInit(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_VerifyRecoverInit", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_VerifyRecoverInit(session, mechanism, key);
+    write_audit("C_VerifyRecoverInit", session, mechanism->mechanism, result);
+    return result;
+}
+
+CK_RV C_GenerateKey(CK_SESSION_HANDLE session,
+                    CK_MECHANISM_PTR mechanism,
+                    CK_ATTRIBUTE_PTR attributes,
+                    CK_ULONG attribute_count,
+                    CK_OBJECT_HANDLE_PTR key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_GenerateKey", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_GenerateKey(session, mechanism, attributes, attribute_count, key);
+    write_audit("C_GenerateKey", session, mechanism->mechanism, result);
     return result;
 }
 
@@ -288,14 +413,9 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE session,
                         CK_OBJECT_HANDLE_PTR public_key,
                         CK_OBJECT_HANDLE_PTR private_key) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
-    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
-        result = CKR_MECHANISM_INVALID;
-        write_audit("C_GenerateKeyPair", session, mechanism == NULL ? 0 : mechanism->mechanism, result);
-        return result;
-    }
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_GenerateKeyPair", session, mechanism);
+    if (result != CKR_OK) return result;
     result = backend->C_GenerateKeyPair(session, mechanism, public_template, public_count, private_template, private_count, public_key, private_key);
     write_audit("C_GenerateKeyPair", session, mechanism->mechanism, result);
     return result;
@@ -308,14 +428,9 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE session,
                 CK_BYTE_PTR wrapped_key,
                 CK_ULONG_PTR wrapped_key_length) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
-    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
-        result = CKR_MECHANISM_INVALID;
-        write_audit("C_WrapKey", session, mechanism == NULL ? 0 : mechanism->mechanism, result);
-        return result;
-    }
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_WrapKey", session, mechanism);
+    if (result != CKR_OK) return result;
     result = backend->C_WrapKey(session, mechanism, wrapping_key, key, wrapped_key, wrapped_key_length);
     write_audit("C_WrapKey", session, mechanism->mechanism, result);
     return result;
@@ -330,16 +445,26 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE session,
                   CK_ULONG attribute_count,
                   CK_OBJECT_HANDLE_PTR key) {
     CK_RV result = load_backend();
-    if (result != CKR_OK) {
-        return result;
-    }
-    if (mechanism == NULL || !mechanism_allowed(mechanism->mechanism)) {
-        result = CKR_MECHANISM_INVALID;
-        write_audit("C_UnwrapKey", session, mechanism == NULL ? 0 : mechanism->mechanism, result);
-        return result;
-    }
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_UnwrapKey", session, mechanism);
+    if (result != CKR_OK) return result;
     result = backend->C_UnwrapKey(session, mechanism, unwrapping_key, wrapped_key, wrapped_key_length, attributes, attribute_count, key);
     write_audit("C_UnwrapKey", session, mechanism->mechanism, result);
+    return result;
+}
+
+CK_RV C_DeriveKey(CK_SESSION_HANDLE session,
+                  CK_MECHANISM_PTR mechanism,
+                  CK_OBJECT_HANDLE base_key,
+                  CK_ATTRIBUTE_PTR attributes,
+                  CK_ULONG attribute_count,
+                  CK_OBJECT_HANDLE_PTR key) {
+    CK_RV result = load_backend();
+    if (result != CKR_OK) return result;
+    result = check_mechanism("C_DeriveKey", session, mechanism);
+    if (result != CKR_OK) return result;
+    result = backend->C_DeriveKey(session, mechanism, base_key, attributes, attribute_count, key);
+    write_audit("C_DeriveKey", session, mechanism->mechanism, result);
     return result;
 }
 
@@ -356,12 +481,19 @@ CK_RV C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR list) {
     proxy.C_GetFunctionList = C_GetFunctionList;
     proxy.C_GetMechanismList = C_GetMechanismList;
     proxy.C_GetMechanismInfo = C_GetMechanismInfo;
+    proxy.C_EncryptInit = C_EncryptInit;
+    proxy.C_DecryptInit = C_DecryptInit;
+    proxy.C_DigestInit = C_DigestInit;
     proxy.C_SignInit = C_SignInit;
     proxy.C_Sign = C_Sign;
+    proxy.C_SignRecoverInit = C_SignRecoverInit;
     proxy.C_VerifyInit = C_VerifyInit;
+    proxy.C_VerifyRecoverInit = C_VerifyRecoverInit;
+    proxy.C_GenerateKey = C_GenerateKey;
     proxy.C_GenerateKeyPair = C_GenerateKeyPair;
     proxy.C_WrapKey = C_WrapKey;
     proxy.C_UnwrapKey = C_UnwrapKey;
+    proxy.C_DeriveKey = C_DeriveKey;
     *list = &proxy;
     return CKR_OK;
 }
