@@ -13,8 +13,8 @@ RUN curl --fail --location --proto '=https' --tlsv1.2 \
       "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz \
  && curl --fail --location --proto '=https' --tlsv1.2 \
       "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz.sha256" -o openssl.sha256 \
- && sed -i 's#  openssl-[^ ]*\.tar\.gz#  openssl.tar.gz#' openssl.sha256 \
- && sha256sum -c openssl.sha256 \
+ && expected="$(cut -d ' ' -f 1 openssl.sha256)" \
+ && printf '%s  %s\n' "$expected" openssl.tar.gz | sha256sum -c - \
  && tar -xzf openssl.tar.gz \
  && cd "openssl-${OPENSSL_VERSION}" \
  && ./config --prefix=/opt/openssl --openssldir=/opt/openssl/ssl shared no-tests \
@@ -23,12 +23,13 @@ RUN curl --fail --location --proto '=https' --tlsv1.2 \
 RUN git clone --depth 1 --branch "${LIBOQS_VERSION}" https://github.com/open-quantum-safe/liboqs.git \
  && cmake -S liboqs -B liboqs/build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/oqs \
-      -DBUILD_SHARED_LIBS=ON -DOQS_BUILD_ONLY_LIB=ON \
+      -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DOQS_BUILD_ONLY_LIB=ON \
  && cmake --build liboqs/build \
  && cmake --install liboqs/build
 RUN git clone --depth 1 --branch "${OQS_PROVIDER_VERSION}" https://github.com/open-quantum-safe/oqs-provider.git \
  && cmake -S oqs-provider -B oqs-provider/build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/oqs-provider \
+      -DCMAKE_INSTALL_LIBDIR=lib \
       -DOPENSSL_ROOT_DIR=/opt/openssl -Dliboqs_DIR=/opt/oqs/lib/cmake/liboqs \
  && cmake --build oqs-provider/build \
  && cmake --install oqs-provider/build
@@ -43,6 +44,6 @@ COPY smoke.sh /usr/local/bin/oqs-smoke
 ENV PATH=/opt/openssl/bin:$PATH \
     LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib:/opt/oqs/lib64:/opt/oqs/lib \
     OPENSSL_CONF=/etc/pqm/openssl.cnf \
-    OPENSSL_MODULES=/opt/oqs-provider/lib64/ossl-modules:/opt/oqs-provider/lib/ossl-modules
+    OPENSSL_MODULES=/opt/oqs-provider/lib/ossl-modules
 USER oqs
 ENTRYPOINT ["oqs-smoke"]
