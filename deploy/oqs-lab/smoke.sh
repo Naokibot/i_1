@@ -29,7 +29,6 @@ cleanup() {
   if [ "$status" -ne 0 ]; then
     print_log providers "$work/providers.log"
     print_log kems "$work/kems.log"
-    print_log groups "$work/groups.log"
     print_log server "$work/server.log"
     print_log client-stdout "$work/client.out"
     print_log client-stderr "$work/client.log"
@@ -66,14 +65,6 @@ openssl list \
   -kem-algorithms | tee "$work/kems.log"
 grep -qi "$KEM_ALGORITHM" "$work/kems.log" \
   || fail "KEM algorithm is unavailable: $KEM_ALGORITHM"
-
-openssl list \
-  -provider-path "$OPENSSL_MODULES" \
-  -provider default \
-  -provider oqsprovider \
-  -tls-groups -tls1_3 | tee "$work/groups.log"
-grep -qi "$TLS_GROUP" "$work/groups.log" \
-  || fail "TLS group is unavailable: $TLS_GROUP"
 
 # The FrodoKEM algorithm is intentionally selected because it is supplied by
 # oqs-provider/liboqs and does not overlap OpenSSL 3.5's built-in ML-KEM.
@@ -165,9 +156,9 @@ grep -qi 'HTTP/1.0 200 ok' "$work/client.out" \
 grep -Eq 'Protocol version: TLSv1\.3|Protocol *: TLSv1\.3' "$work/client.log" \
   || fail "TLS 1.3 was not negotiated"
 
-# Both peers advertise only TLS_GROUP, so a successful TLS 1.3 handshake is a
-# stronger interoperability check than matching OpenSSL's presentation name,
-# which can differ from the configuration token used by oqs-provider.
+# OpenSSL 3.5 does not provide `openssl list -tls-groups`. Both peers are
+# therefore restricted to TLS_GROUP and the successful TLS 1.3 handshake is
+# the authoritative group-availability and interoperability check.
 wait "$server_pid" || fail "TLS server exited with an error"
 server_pid=
 
