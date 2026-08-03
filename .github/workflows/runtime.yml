@@ -83,7 +83,7 @@ jobs:
           echo "${OPENSSL_ROOT}/lib64" | sudo tee /etc/ld.so.conf.d/openssl-3.5.conf
           sudo ldconfig
           "${OPENSSL_ROOT}/bin/openssl" version
-      - name: Build native components with strict warnings
+      - name: Configure TLS gateway against OpenSSL 3.5
         shell: bash
         env:
           PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
@@ -91,10 +91,19 @@ jobs:
           PKG_CONFIG_PATH: /opt/openssl-3.5/lib64/pkgconfig:/opt/openssl-3.5/lib/pkgconfig
         run: |
           set -euo pipefail
-          cmake -S native/tls-gateway -B build/tls -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}"
-          cmake --build build/tls --parallel 2
-          cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/pkcs11 --parallel 2
+          cmake -S native/tls-gateway -B build/tls \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}" \
+            -DOPENSSL_INCLUDE_DIR="${OPENSSL_ROOT}/include" \
+            -DOPENSSL_SSL_LIBRARY="${OPENSSL_ROOT}/lib64/libssl.so" \
+            -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_ROOT}/lib64/libcrypto.so"
+          grep -E 'OPENSSL_(INCLUDE_DIR|SSL_LIBRARY|CRYPTO_LIBRARY):' build/tls/CMakeCache.txt
+      - name: Build TLS gateway with strict warnings
+        run: cmake --build build/tls --parallel 2 --verbose
+      - name: Configure PKCS#11 proxy
+        run: cmake -S native/pkcs11-proxy -B build/pkcs11 -DCMAKE_BUILD_TYPE=Release
+      - name: Build PKCS#11 proxy with strict warnings
+        run: cmake --build build/pkcs11 --parallel 2 --verbose
       - name: Exercise hybrid TLS gateway
         shell: bash
         env:
