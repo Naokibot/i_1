@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Naokibot/i_1/internal/model"
 	"github.com/Naokibot/i_1/internal/risk"
@@ -13,25 +15,48 @@ import (
 	"github.com/Naokibot/i_1/internal/store"
 )
 
+const (
+	defaultMaxConcurrentScans = 8
+	maxScanTargetBytes        = 2048
+)
+
 type Engine struct {
 	store      *store.Store
 	sourceRoot string
+	scanSlots  chan struct{}
 }
 
 func New(st *store.Store, sourceRoot string) (*Engine, error) {
+	return newWithConcurrency(st, sourceRoot, defaultMaxConcurrentScans)
+}
+
+func newWithConcurrency(st *store.Store, sourceRoot string, maxConcurrentScans int) (*Engine, error) {
+	if st == nil {
+		return nil, fmt.Errorf("store is required")
+	}
+	if maxConcurrentScans < 1 || maxConcurrentScans > 256 {
+		return nil, fmt.Errorf("max concurrent scans must be between 1 and 256")
+	}
 	abs, err := filepath.Abs(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{store: st, sourceRoot: abs}, nil
+	return &Engine{store: st, sourceRoot: abs, scanSlots: make(chan struct{}, maxConcurrentScans)}, nil
 }
 
 func (e *Engine) Start(req model.ScanRequest) (model.ScanJob, error) {
 	if err := validate(req); err != nil {
 		return model.ScanJob{}, err
 	}
+	select {
+	case e.scanSlots <- struct{}{}:
+	case <-time.After(250 * time.Millisecond):
+		return model.ScanJob{}, fmt.Errorf("scan capacity reached; retry later")
+	}
+
 	j := model.ScanJob{ID: model.NewID("scan"), Request: req, Status: "queued", StartedAt: time.Now().UTC()}
 	if err := e.store.CreateScan(j); err != nil {
+		<-e.scanSlots
 		return model.ScanJob{}, err
 	}
 	go e.run(j)
@@ -39,6 +64,7 @@ func (e *Engine) Start(req model.ScanRequest) (model.ScanJob, error) {
 }
 
 func (e *Engine) run(j model.ScanJob) {
+	defer func() { <-e.scanSlots }()
 	j.Status = "running"
 	_ = e.store.UpdateScan(j)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -89,9 +115,16 @@ func (e *Engine) Recalculate(id string) (model.Asset, error) {
 	a.Migration = risk.Recommend(a)
 	return a, e.store.UpsertAsset(a, "risk-engine")
 }
+
 func validate(r model.ScanRequest) error {
 	if r.Target == "" {
 		return fmt.Errorf("target is required")
+	}
+	if !utf8.ValidString(r.Target) || len(r.Target) > maxScanTargetBytes {
+		return fmt.Errorf("target is invalid or too long")
+	}
+	if strings.IndexFunc(r.Target, unicode.IsControl) >= 0 {
+		return fmt.Errorf("target contains control characters")
 	}
 	switch strings.ToLower(r.Kind) {
 	case "tls", "ssh", "source":

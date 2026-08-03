@@ -1,7 +1,9 @@
-FROM golang:1.23-alpine AS build
+FROM golang:1.25.12-alpine AS build
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/observer ./cmd/observer
+RUN CGO_ENABLED=0 go test ./... \
+ && CGO_ENABLED=0 go vet ./... \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/observer ./cmd/observer
 
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app

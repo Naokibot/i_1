@@ -14,6 +14,12 @@ import (
 	"github.com/Naokibot/i_1/internal/model"
 )
 
+const (
+	maxSSHIdentificationLines = 50
+	maxSSHIdentificationBytes = 255
+	maxSSHPacketBytes         = 256 << 10
+)
+
 func ScanSSH(ctx context.Context, req model.ScanRequest) (model.Asset, []model.Finding, error) {
 	port := req.Port
 	if port == 0 {
@@ -27,21 +33,10 @@ func ScanSSH(ctx context.Context, req model.ScanRequest) (model.Asset, []model.F
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
-	br := bufio.NewReader(conn)
-	banner := ""
-	for i := 0; i < 50; i++ {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			return model.Asset{}, nil, err
-		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "SSH-") {
-			banner = line
-			break
-		}
-	}
-	if banner == "" {
-		return model.Asset{}, nil, fmt.Errorf("SSH identification not received")
+	br := bufio.NewReaderSize(conn, 4096)
+	banner, err := readSSHIdentification(br)
+	if err != nil {
+		return model.Asset{}, nil, err
 	}
 	if _, err := io.WriteString(conn, "SSH-2.0-PQMObservatory_0.1\r\n"); err != nil {
 		return model.Asset{}, nil, err
@@ -77,6 +72,41 @@ func ScanSSH(ctx context.Context, req model.ScanRequest) (model.Asset, []model.F
 	return asset, findings, nil
 }
 
+func readSSHIdentification(r *bufio.Reader) (string, error) {
+	for i := 0; i < maxSSHIdentificationLines; i++ {
+		line, err := readBoundedLine(r, maxSSHIdentificationBytes)
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "SSH-") {
+			if !strings.HasPrefix(line, "SSH-2.0-") && !strings.HasPrefix(line, "SSH-1.99-") {
+				return "", fmt.Errorf("unsupported SSH protocol identification")
+			}
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("SSH identification not received")
+}
+
+func readBoundedLine(r *bufio.Reader, limit int) (string, error) {
+	buf := make([]byte, 0, limit)
+	for len(buf) <= limit {
+		fragment, err := r.ReadSlice('\n')
+		if len(buf)+len(fragment) > limit {
+			return "", fmt.Errorf("SSH identification line exceeds %d bytes", limit)
+		}
+		buf = append(buf, fragment...)
+		if err == nil {
+			return string(buf), nil
+		}
+		if err != bufio.ErrBufferFull {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("SSH identification line exceeds %d bytes", limit)
+}
+
 func readSSHPacket(r *bufio.Reader) ([]byte, error) {
 	hdr := make([]byte, 5)
 	if _, err := io.ReadFull(r, hdr); err != nil {
@@ -84,7 +114,7 @@ func readSSHPacket(r *bufio.Reader) ([]byte, error) {
 	}
 	n := int(binary.BigEndian.Uint32(hdr[:4]))
 	pad := int(hdr[4])
-	if n < 2 || n > 2_000_000 {
+	if n < 2 || n > maxSSHPacketBytes {
 		return nil, fmt.Errorf("invalid SSH packet length %d", n)
 	}
 	rest := make([]byte, n-1)

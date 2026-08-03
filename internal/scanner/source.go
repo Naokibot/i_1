@@ -56,6 +56,9 @@ func ScanSource(ctx context.Context, req model.ScanRequest, root string) (model.
 			return ctx.Err()
 		default:
 		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if d.IsDir() {
 			if path != target && skipDir(d.Name()) {
 				return filepath.SkipDir
@@ -69,38 +72,20 @@ func ScanSource(ctx context.Context, req model.ScanRequest, root string) (model.
 			return nil
 		}
 		fi, err := d.Info()
-		if err != nil || fi.Size() > 10<<20 {
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() > 10<<20 {
 			return nil
 		}
-		f, err := os.Open(path)
+		rel, err := filepath.Rel(target, path)
 		if err != nil {
 			return nil
 		}
-		defer f.Close()
+		fileFindings, err := scanSourceFile(ctx, path, rel, asset.ID, &asset, seen)
+		if err != nil {
+			return nil
+		}
 		files++
 		bytesRead += fi.Size()
-		rel, _ := filepath.Rel(target, path)
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		line := 0
-		for scanner.Scan() {
-			line++
-			text := scanner.Text()
-			for _, rule := range sourceRules {
-				if rule.re.MatchString(text) {
-					loc := fmt.Sprintf("%s:%d", rel, line)
-					findings = append(findings, newFinding(asset.ID, rule.id, rule.severity, rule.title, "Cryptographic API or configuration matched", loc, trimEvidence(text), rule.remediation))
-					key := rule.algorithm + "|" + rule.primitive
-					if !seen[key] {
-						c := component("algorithm", rule.algorithm, rule.primitive, "source-code dependency", "source scan")
-						c.Metadata = map[string]string{"firstSeen": loc}
-						asset.Crypto = append(asset.Crypto, c)
-						seen[key] = true
-					}
-				}
-			}
-			detectPQC(text, locOr(rel, line), &asset, seen)
-		}
+		findings = append(findings, fileFindings...)
 		return nil
 	})
 	if err != nil {
@@ -112,10 +97,54 @@ func ScanSource(ctx context.Context, req model.ScanRequest, root string) (model.
 	return asset, findings, nil
 }
 
+func scanSourceFile(ctx context.Context, path, rel, assetID string, asset *model.Asset, seen map[string]bool) ([]model.Finding, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	findings := []model.Finding{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	line := 0
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		line++
+		text := scanner.Text()
+		for _, rule := range sourceRules {
+			if rule.re.MatchString(text) {
+				loc := fmt.Sprintf("%s:%d", rel, line)
+				findings = append(findings, newFinding(assetID, rule.id, rule.severity, rule.title, "Cryptographic API or configuration matched", loc, trimEvidence(text), rule.remediation))
+				key := rule.algorithm + "|" + rule.primitive
+				if !seen[key] {
+					c := component("algorithm", rule.algorithm, rule.primitive, "source-code dependency", "source scan")
+					c.Metadata = map[string]string{"firstSeen": loc}
+					asset.Crypto = append(asset.Crypto, c)
+					seen[key] = true
+				}
+			}
+		}
+		detectPQC(text, locOr(rel, line), asset, seen)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return findings, nil
+}
+
 func securePath(root, target string) (string, error) {
 	r, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
+	}
+	r, err = filepath.EvalSymlinks(r)
+	if err != nil {
+		return "", fmt.Errorf("resolve source root: %w", err)
 	}
 	p := target
 	if !filepath.IsAbs(p) {
@@ -124,6 +153,10 @@ func securePath(root, target string) (string, error) {
 	p, err = filepath.Abs(p)
 	if err != nil {
 		return "", err
+	}
+	p, err = filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", fmt.Errorf("resolve source target: %w", err)
 	}
 	rel, err := filepath.Rel(r, p)
 	if err != nil {
