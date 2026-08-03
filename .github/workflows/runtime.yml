@@ -1,0 +1,186 @@
+name: runtime-platform
+
+on:
+  push:
+    branches:
+      - main
+      - agent/pqm-runtime-platform
+    paths:
+      - 'cmd/**'
+      - 'internal/runtime/**'
+      - 'native/**'
+      - 'java/migration-provider/**'
+      - 'runtime-tests/**'
+      - 'deploy/**'
+      - 'docs/**'
+      - '.github/workflows/runtime.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/runtime/**'
+      - 'native/**'
+      - 'java/migration-provider/**'
+      - 'runtime-tests/**'
+      - 'deploy/**'
+      - 'docs/**'
+      - '.github/workflows/runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-platform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENSSL_VERSION: 3.5.7
+  OPENSSL_ROOT: /opt/openssl-3.5
+
+jobs:
+  go:
+    name: Go control plane
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Verify formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Run race-enabled tests
+        run: go test -race ./...
+      - name: Run static analysis
+        run: go vet ./...
+      - name: Build runtime executables
+        run: go build ./cmd/runtime-controller ./cmd/gateway-agent ./cmd/telemetry-reporter ./cmd/recrypt-worker ./cmd/emergency-sign
+
+  native:
+    name: OpenSSL, TLS and PKCS#11 validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Install build and interoperability dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc make ninja-build perl libp11-kit-dev softhsm2 opensc python3 openssh-client openssh-server
+      - name: Build verified OpenSSL 3.5 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}"
+          curl -fsSLO "${base}/openssl-${OPENSSL_VERSION}.tar.gz"
+          curl -fsSLO "${base}/openssl-${OPENSSL_VERSION}.tar.gz.sha256"
+          sha256sum -c "openssl-${OPENSSL_VERSION}.tar.gz.sha256"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix="${OPENSSL_ROOT}" --openssldir="${OPENSSL_ROOT}/ssl" shared no-tests
+          make -j2
+          sudo make install_sw
+          libdir="${OPENSSL_ROOT}/lib64"
+          if [[ ! -f "${libdir}/libssl.so" ]]; then
+            libdir="${OPENSSL_ROOT}/lib"
+          fi
+          test -f "${libdir}/libssl.so"
+          test -f "${libdir}/libcrypto.so"
+          echo "OPENSSL_LIBDIR=${libdir}" >>"${GITHUB_ENV}"
+          echo "${libdir}" | sudo tee /etc/ld.so.conf.d/openssl-3.5.conf
+          sudo ldconfig
+          "${OPENSSL_ROOT}/bin/openssl" version -a
+          "${OPENSSL_ROOT}/bin/openssl" list -kem-algorithms | grep -q 'ML-KEM-768'
+          "${OPENSSL_ROOT}/bin/openssl" list -tls1_3 -tls-groups | grep -q 'X25519MLKEM768'
+      - name: Configure TLS gateway against OpenSSL 3.5
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          PKG_CONFIG_PATH: /opt/openssl-3.5/lib64/pkgconfig:/opt/openssl-3.5/lib/pkgconfig
+        run: |
+          set -euo pipefail
+          cmake -S native/tls-gateway -B build/tls -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}" \
+            -DOPENSSL_INCLUDE_DIR="${OPENSSL_ROOT}/include" \
+            -DOPENSSL_SSL_LIBRARY="${OPENSSL_LIBDIR}/libssl.so" \
+            -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_LIBDIR}/libcrypto.so"
+          grep -E 'OPENSSL_(INCLUDE_DIR|SSL_LIBRARY|CRYPTO_LIBRARY):' build/tls/CMakeCache.txt
+      - name: Build TLS gateway with strict warnings and sanitizers
+        run: cmake --build build/tls --parallel 2 --verbose
+      - name: Configure and build PKCS#11 proxy
+        run: |
+          cmake -S native/pkcs11-proxy -B build/pkcs11 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/pkcs11 --parallel 2 --verbose
+      - name: Exercise hybrid TLS gateway
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          GATEWAY: ./build/tls/pqm-tls-gateway
+        run: bash runtime-tests/tls_gateway_smoke.sh
+      - name: Run adversarial TLS validation
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          GATEWAY: ./build/tls/pqm-tls-gateway
+          OPENSSL: /opt/openssl-3.5/bin/openssl
+        run: bash runtime-tests/tls_gateway_security.sh
+      - name: Exercise ML-KEM envelope encryption
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+        run: bash runtime-tests/recrypt_smoke.sh
+      - name: Run adversarial envelope validation
+        shell: bash
+        env:
+          PATH: /opt/openssl-3.5/bin:${{ env.PATH }}
+          LD_LIBRARY_PATH: /opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+          OPENSSL: /opt/openssl-3.5/bin/openssl
+        run: bash runtime-tests/recrypt_adversarial.sh
+      - name: Exercise PKCS#11 proxy with SoftHSM2
+        shell: bash
+        env:
+          PROXY: ./build/pkcs11/libpqm-pkcs11.so
+        run: bash runtime-tests/pkcs11_softhsm_interop.sh
+      - name: Validate SSH relay and VPN switching policies
+        shell: bash
+        run: bash runtime-tests/ssh_vpn_security.sh
+
+  java:
+    name: Java migration provider
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        with:
+          gradle-version: '8.14.3'
+      - name: Run provider tests
+        working-directory: java/migration-provider
+        shell: bash
+        run: |
+          set +e
+          gradle test --no-daemon --stacktrace
+          status=$?
+          if test "$status" -ne 0; then
+            find build/test-results/test -maxdepth 1 -type f -name '*.xml' -print -exec cat {} \; || true
+          fi
+          exit "$status"

@@ -1,0 +1,41 @@
+name: oqs-provider-interoperability
+
+on:
+  push:
+    branches:
+      - main
+      - agent/pqm-runtime-platform
+    paths:
+      - 'deploy/oqs-lab/**'
+      - '.github/workflows/oqs-interop.yml'
+  pull_request:
+    paths:
+      - 'deploy/oqs-lab/**'
+      - '.github/workflows/oqs-interop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oqs-provider-interoperability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oqs-provider:
+    name: liboqs and oqs-provider TLS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build pinned interoperability image
+        run: |
+          docker build \
+            --pull \
+            --build-arg OPENSSL_VERSION=3.5.7 \
+            --build-arg LIBOQS_VERSION=0.15.0 \
+            --build-arg OQS_PROVIDER_VERSION=0.11.0 \
+            --tag pqm-oqs-interop:ci \
+            deploy/oqs-lab
+      - name: Run KEM and TLS interoperability checks
+        run: docker run --rm --network none pqm-oqs-interop:ci

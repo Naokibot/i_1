@@ -1,0 +1,19 @@
+{
+  "revision": "payments-hybrid-001",
+  "kind": "tls",
+  "listen": "0.0.0.0:8443",
+  "upstream": "payments.internal:443",
+  "serverName": "payments.internal",
+  "certificate": "/etc/pqm/tls/listener-chain.pem",
+  "privateKey": "/etc/pqm/tls/listener-key.pem",
+  "caFile": "/etc/pqm/tls/upstream-ca.pem",
+  "groups": ["X25519MLKEM768"],
+  "provider": "default",
+  "verifyUpstream": true,
+  "telemetryFile": "/var/log/pqm/gateway.jsonl",
+  "command": ["/usr/local/bin/pqm-tls-gateway"],
+  "environment": {
+    "PQM_FALLBACK_ALLOWED": "false"
+  },
+  "healthAddress": "127.0.0.1:8443"
+}
